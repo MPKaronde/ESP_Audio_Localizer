@@ -18,13 +18,13 @@
 // ── Tunable constants ─────────────────────────────────────────────────────────
 static constexpr int    SAMPLES         = 300;
 // I2S streams all 4 channels interleaved at I2S_SAMPLE_RATE total.
-// Each mic gets I2S_SAMPLE_RATE/4 = 10 kHz → 100 µs per mic-sample.
-static constexpr int    I2S_SAMPLE_RATE = 40000;
+// Each mic gets I2S_SAMPLE_RATE/4 = 20 kHz → 50 µs per mic-sample.
+static constexpr int    I2S_SAMPLE_RATE = 80000;
 static constexpr int    I2S_DMA_BUF_LEN = 256;
 static constexpr int    I2S_DMA_BUF_CNT = 4;
 
-// XCORR_RANGE: at 10 kHz/mic, max TDOA across 17.7 cm diagonal ≈ 5.2 samples. Use 7.
-static constexpr int    XCORR_RANGE     = 7;
+// XCORR_RANGE: at 20 kHz/mic (80 kHz total), max TDOA across 17.7 cm diagonal ≈ 10.3 samples. Use 12.
+static constexpr int    XCORR_RANGE     = 12;
 
 // VOLTAGE: per-mic 12-bit ADC count at idle. Calibrate with MODE_TEST first.
 static constexpr int    VOLTAGE[4]      = {1919, 1913, 1915, 1925};
@@ -34,10 +34,13 @@ static constexpr int    THRESHOLD       = 400;
 
 static constexpr double SPEED_SOUND     = 343.0;
 static constexpr bool   INCL_EDGE       = false;
+// NCC_THRESHOLD: minimum normalized cross-correlation peak to accept a TDOA estimate.
+// Raise if random-direction readings persist; lower if real sounds are being rejected.
+static constexpr float  NCC_THRESHOLD   = 0.15f;
 
-// CH_SKEW_US: within-cycle sampling delay per channel (25 µs/slot at 40 kHz).
-// Scan order CH0→CH3→CH6→CH7 means mic1 is sampled 25 µs after mic0, etc.
-static constexpr double CH_SKEW_US[4]  = {0.0, 25.0, 50.0, 75.0};
+// CH_SKEW_US: within-cycle sampling delay per channel (12.5 µs/slot at 80 kHz).
+// Scan order CH0→CH3→CH6→CH7 means mic1 is sampled 12.5 µs after mic0, etc.
+static constexpr double CH_SKEW_US[4]  = {0.0, 12.5, 25.0, 37.5};
 
 // ── ADC wiring ────────────────────────────────────────────────────────────────
 // GPIO 36 (VP) = ADC1_CH0  → MIC 0
@@ -101,7 +104,18 @@ static double xcorr_tdoa(const int* a, const unsigned int* a_ts, int va,
     for (int i = 1; i <= 2 * XCORR_RANGE; i++)
         if (xcorr[i] > xcorr[pk]) pk = i;
 
-    if (xcorr[pk] <= 0) return NAN;   // signals uncorrelated → no reliable TDOA
+    // NCC quality gate: peak must be large relative to both signal energies.
+    // Filters noisy-but-positive peaks that give wrong TDOA on low-SNR recordings.
+    {
+        float ea = 0.0f, eb = 0.0f;
+        for (int i = 0; i < SAMPLES; i++) {
+            float da = (float)(a[i] - va), db = (float)(b[i] - vb);
+            ea += da*da; eb += db*db;
+        }
+        if (ea < 1.0f || eb < 1.0f ||
+            (float)xcorr[pk] / (sqrtf(ea) * sqrtf(eb)) < NCC_THRESHOLD)
+            return NAN;
+    }
 
     double interp = pk;
     if (pk > 0 && pk < 2 * XCORR_RANGE) {
@@ -185,6 +199,7 @@ static Vector sound_direction() {
         for (int j = i + 1; j < 6; j++) {
             if ((i == 0 && j == 5) || (i == 1 && j == 4)) continue; // co-axial pairs
             if (magnitude(cones[i].n) < 0.5 || magnitude(cones[j].n) < 0.5) continue;
+            if (dot(cones[i].n, cones[j].n) > 0.94) continue; // < 20° apart → ill-conditioned
             AnnotatedVec av = cone_intersect(cones[i], cones[j]);
             if (!av.edge || INCL_EDGE) candidates[n++] = av.v;
         }
