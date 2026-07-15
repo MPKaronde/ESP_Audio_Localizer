@@ -30,13 +30,15 @@ static constexpr int    XCORR_RANGE     = 12;
 static constexpr int    VOLTAGE[4]      = {1919, 1913, 1915, 1925};
 
 // THRESHOLD: single-sample abs deviation that fires the recording trigger.
-static constexpr int    THRESHOLD       = 400;
+static constexpr int           THRESHOLD    = 300; //400
+// COOLDOWN_MS: silence window after each recording — suppresses echo re-triggers.
+static constexpr unsigned long COOLDOWN_MS  = 200;
 
 static constexpr double SPEED_SOUND     = 343.0;
 static constexpr bool   INCL_EDGE       = false;
 // NCC_THRESHOLD: minimum normalized cross-correlation peak to accept a TDOA estimate.
 // Raise if random-direction readings persist; lower if real sounds are being rejected.
-static constexpr float  NCC_THRESHOLD   = 0.15f;
+static constexpr float  NCC_THRESHOLD   = 0.15f; // .15
 
 // CH_SKEW_US: within-cycle sampling delay per channel (12.5 µs/slot at 80 kHz).
 // Scan order CH0→CH3→CH6→CH7 means mic1 is sampled 12.5 µs after mic0, etc.
@@ -93,10 +95,10 @@ static double xcorr_tdoa(const int* a, const unsigned int* a_ts, int va,
     static long xcorr[2 * XCORR_RANGE + 1];
     for (int lag = -XCORR_RANGE; lag <= XCORR_RANGE; lag++) {
         long corr = 0;
-        int  lo   = (lag >= 0) ? lag     : 0;
-        int  hi   = (lag >= 0) ? SAMPLES : SAMPLES + lag;
-        for (int i = lo; i < hi; i++)
-            corr += (int32_t)(a[i] - va) * (int32_t)(b[i - lag] - vb);
+        int  lo2  = (lag >= 0) ? lag + 1 : 1;   // keeps a[i-1] and b[i-lag-1] in bounds
+        int  hi2  = (lag >= 0) ? SAMPLES : SAMPLES + lag;
+        for (int i = lo2; i < hi2; i++)
+            corr += (int32_t)(a[i] - a[i-1]) * (int32_t)(b[i-lag] - b[i-lag-1]);
         xcorr[lag + XCORR_RANGE] = corr;
     }
 
@@ -108,8 +110,8 @@ static double xcorr_tdoa(const int* a, const unsigned int* a_ts, int va,
     // Filters noisy-but-positive peaks that give wrong TDOA on low-SNR recordings.
     {
         float ea = 0.0f, eb = 0.0f;
-        for (int i = 0; i < SAMPLES; i++) {
-            float da = (float)(a[i] - va), db = (float)(b[i] - vb);
+        for (int i = 1; i < SAMPLES; i++) {
+            float da = (float)(a[i] - a[i-1]), db = (float)(b[i] - b[i-1]);
             ea += da*da; eb += db*db;
         }
         if (ea < 1.0f || eb < 1.0f ||
@@ -292,6 +294,7 @@ void loop() {
 #else
 // ── Production loop: outputs "az_degrees\n" (0–360) for visualizer.py ────────
 void loop() {
+    static unsigned long last_output_ms = 0;
     size_t bytes_read;
     i2s_read(I2S_NUM_0, dma_buf, sizeof(dma_buf), &bytes_read, portMAX_DELAY);
     const int n = (int)(bytes_read / 2);
@@ -305,7 +308,7 @@ void loop() {
         const int val = (int)(raw & 0xFFF);
 
         if (!recording) {
-            if (abs(val - VOLTAGE[m]) > THRESHOLD) {
+            if (abs(val - VOLTAGE[m]) > THRESHOLD && millis() - last_output_ms > COOLDOWN_MS) {
                 recording    = true;
                 align_to_ch0 = true;
                 for (int i = 0; i < 4; i++) fill[i] = 0;
@@ -327,6 +330,7 @@ void loop() {
     for (int i = 0; i < 4; i++) if (fill[i] < SAMPLES) return;
 
     recording = false;
+    last_output_ms = millis();
     Vector dir = sound_direction();
     double az  = atan2(dir.y, dir.x) * 180.0 / M_PI;
     if (az < 0.0) az += 360.0;   // convert (-180,180] → [0,360)
