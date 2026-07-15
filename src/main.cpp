@@ -13,11 +13,17 @@
 // MODE_PRODUCTION → outputs "az_degrees\n" (0–360) for visualizer.py
 #define MODE_PRODUCTION 0
 #define MODE_TEST       1
+#define MODE_ROS        2
 #define MODE            MODE_PRODUCTION
 
 #define CROWDED_AREA    0   // 1 = periodic background xcorr subtraction for noisy environments
 
 // ── Tunable constants ─────────────────────────────────────────────────────────
+// SAMPLES: recording window = SAMPLES / (I2S_SAMPLE_RATE/4) ms. Trade-off:
+//   fewer → shorter window, less multi-speaker bleed, noisier xcorr
+//   more  → better voice SNR, higher risk of capturing a second speaker mid-window
+// Multi-speaker rule of thumb: keep window ≤ 15 ms (SAMPLES ≤ 300).
+// Single-speaker / music: SAMPLES = 500–600 improves voice accuracy noticeably.
 static constexpr int    SAMPLES         = 300;
 // I2S streams all 4 channels interleaved at I2S_SAMPLE_RATE total.
 // Each mic gets I2S_SAMPLE_RATE/4 = 20 kHz → 50 µs per mic-sample.
@@ -416,8 +422,12 @@ void loop() {
     recording = false;
     last_output_ms = millis();
     Vector dir = sound_direction();
+#if MODE == MODE_ROS
+    Serial.printf("Vector(%.4f,%.4f,%.4f)\n", dir.x, dir.y, dir.z);
+#else
     double az  = atan2(dir.y, dir.x) * 180.0 / M_PI;
     if (az < 0.0) az += 360.0;   // convert (-180,180] → [0,360)
     Serial.printf("%.1f\n", az);
+#endif
 }
 #endif
