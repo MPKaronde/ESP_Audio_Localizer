@@ -15,6 +15,8 @@
 #define MODE_TEST       1
 #define MODE            MODE_PRODUCTION
 
+#define CROWDED_AREA    0   // 1 = periodic background xcorr subtraction for noisy environments
+
 // ── Tunable constants ─────────────────────────────────────────────────────────
 static constexpr int    SAMPLES         = 300;
 // I2S streams all 4 channels interleaved at I2S_SAMPLE_RATE total.
@@ -33,6 +35,12 @@ static constexpr int    VOLTAGE[4]      = {1919, 1913, 1915, 1925};
 static constexpr int           THRESHOLD    = 300; //400
 // COOLDOWN_MS: silence window after each recording — suppresses echo re-triggers.
 static constexpr unsigned long COOLDOWN_MS  = 200;
+#if CROWDED_AREA
+// BG_UPDATE_MS: how often to re-sample the ambient background (during silence).
+static constexpr unsigned long BG_UPDATE_MS = 2000;
+// BG_ALPHA: EMA weight applied to each new background estimate (0=never update, 1=instant replace).
+static constexpr float         BG_ALPHA     = 0.5f;
+#endif
 
 static constexpr double SPEED_SOUND     = 343.0;
 static constexpr bool   INCL_EDGE       = false;
@@ -85,10 +93,21 @@ struct Cone {
 };
 static Cone cones[6];
 
+#if CROWDED_AREA
+static float         bg_xcorr[6][2 * XCORR_RANGE + 1]; // per-pair background xcorr (float for EMA)
+static bool          bg_valid        = false;
+static int           bg_buf[4][SAMPLES];
+static bool          bg_capturing    = false;
+static bool          bg_align_to_ch0 = false;
+static int           bg_fill[4]      = {0};
+static unsigned long last_bg_ms      = 0;
+#endif
+
 // ── Cross-correlation TDOA ────────────────────────────────────────────────────
 // Returns time offset in seconds. Negative = a received the signal first.
 static double xcorr_tdoa(const int* a, const unsigned int* a_ts, int va,
-                          const int* b, const unsigned int* b_ts, int vb) {
+                          const int* b, const unsigned int* b_ts, int vb,
+                          const float* bg_sub = nullptr) {
     double time_step = 1e-6 * (((long)a_ts[SAMPLES-1] - a_ts[0]) +
                                 ((long)b_ts[SAMPLES-1] - b_ts[0])) / (2.0 * (SAMPLES - 1));
 
@@ -102,9 +121,14 @@ static double xcorr_tdoa(const int* a, const unsigned int* a_ts, int va,
         xcorr[lag + XCORR_RANGE] = corr;
     }
 
+    // Optionally subtract background xcorr (CROWDED_AREA); convert to float for peak detection.
+    float xcorr_f[2 * XCORR_RANGE + 1];
+    for (int i = 0; i <= 2 * XCORR_RANGE; i++)
+        xcorr_f[i] = bg_sub ? (float)xcorr[i] - bg_sub[i] : (float)xcorr[i];
+
     int pk = 0;
     for (int i = 1; i <= 2 * XCORR_RANGE; i++)
-        if (xcorr[i] > xcorr[pk]) pk = i;
+        if (xcorr_f[i] > xcorr_f[pk]) pk = i;
 
     // NCC quality gate: peak must be large relative to both signal energies.
     // Filters noisy-but-positive peaks that give wrong TDOA on low-SNR recordings.
@@ -115,13 +139,13 @@ static double xcorr_tdoa(const int* a, const unsigned int* a_ts, int va,
             ea += da*da; eb += db*db;
         }
         if (ea < 1.0f || eb < 1.0f ||
-            (float)xcorr[pk] / (sqrtf(ea) * sqrtf(eb)) < NCC_THRESHOLD)
+            xcorr_f[pk] / (sqrtf(ea) * sqrtf(eb)) < NCC_THRESHOLD)
             return NAN;
     }
 
     double interp = pk;
     if (pk > 0 && pk < 2 * XCORR_RANGE) {
-        double fa = xcorr[pk-1], fb = xcorr[pk], fc = xcorr[pk+1];
+        double fa = xcorr_f[pk-1], fb = xcorr_f[pk], fc = xcorr_f[pk+1];
         double denom = fa - 2.0*fb + fc;
         if (fabs(denom) > 1.0)
             interp = pk + 0.5*(fa - fc) / denom;
@@ -129,6 +153,31 @@ static double xcorr_tdoa(const int* a, const unsigned int* a_ts, int va,
 
     return time_step * (interp - XCORR_RANGE);
 }
+
+#if CROWDED_AREA
+// Computes first-diff xcorr for all 6 pairs from bg_buf[] and EMA-blends into bg_xcorr[].
+static void update_bg_xcorr() {
+    for (int pi = 0; pi < 6; pi++) {
+        const int a = MIC_PAIRS[pi][0], b = MIC_PAIRS[pi][1];
+        for (int lag = -XCORR_RANGE; lag <= XCORR_RANGE; lag++) {
+            long corr = 0;
+            const int lo2 = (lag >= 0) ? lag + 1 : 1;
+            const int hi2 = (lag >= 0) ? SAMPLES : SAMPLES + lag;
+            for (int i = lo2; i < hi2; i++)
+                corr += (int32_t)(bg_buf[a][i] - bg_buf[a][i-1])
+                      * (int32_t)(bg_buf[b][i-lag] - bg_buf[b][i-lag-1]);
+            const int idx = lag + XCORR_RANGE;
+            bg_xcorr[pi][idx] = bg_valid
+                ? BG_ALPHA * (float)corr + (1.0f - BG_ALPHA) * bg_xcorr[pi][idx]
+                : (float)corr;
+        }
+    }
+    bg_valid     = true;
+    last_bg_ms   = millis();
+    bg_capturing = false;
+    Serial.println("bg");   // diagnostic: remove once verified
+}
+#endif
 
 // ── Cone geometry ─────────────────────────────────────────────────────────────
 static inline int sign_of(double x) { return (x > 0) - (x < 0); }
@@ -178,7 +227,13 @@ static AnnotatedVec cone_intersect(const Cone& c1, const Cone& c2) {
 static Vector sound_direction() {
     for (int i = 0; i < 6; i++) {
         int a = MIC_PAIRS[i][0], b = MIC_PAIRS[i][1];
-        double dt = xcorr_tdoa(reads[a], ts[a], VOLTAGE[a], reads[b], ts[b], VOLTAGE[b]);
+        double dt = xcorr_tdoa(reads[a], ts[a], VOLTAGE[a], reads[b], ts[b], VOLTAGE[b],
+#if CROWDED_AREA
+                               bg_valid ? bg_xcorr[i] : nullptr
+#else
+                               nullptr
+#endif
+                               );
         dt -= (CH_SKEW_US[b] - CH_SKEW_US[a]) * 1e-6;
         if (isnan(dt))                              { cones[i] = Cone(); continue; } // uncorrelated
         if (fabs(dt) < 1e-9)                        { cones[i] = Cone(); continue; } // equidistant
@@ -308,11 +363,32 @@ void loop() {
         const int val = (int)(raw & 0xFFF);
 
         if (!recording) {
-            if (abs(val - VOLTAGE[m]) > THRESHOLD && millis() - last_output_ms > COOLDOWN_MS) {
+            const bool trigger = abs(val - VOLTAGE[m]) > THRESHOLD
+                                 && millis() - last_output_ms > COOLDOWN_MS;
+#if CROWDED_AREA
+            if (trigger) {
+                bg_capturing     = false;
+                recording        = true;
+                align_to_ch0     = true;
+                for (int i = 0; i < 4; i++) fill[i] = 0;
+            } else if (bg_capturing) {
+                if (bg_align_to_ch0) {
+                    if (m == 0) bg_align_to_ch0 = false; else { continue; }
+                }
+                if (bg_fill[m] < SAMPLES) bg_buf[m][bg_fill[m]++] = val;
+            } else if (millis() - last_bg_ms > BG_UPDATE_MS
+                       && millis() - last_output_ms > COOLDOWN_MS) {
+                bg_capturing    = true;
+                bg_align_to_ch0 = true;
+                for (int i = 0; i < 4; i++) bg_fill[i] = 0;
+            }
+#else
+            if (trigger) {
                 recording    = true;
                 align_to_ch0 = true;
                 for (int i = 0; i < 4; i++) fill[i] = 0;
             }
+#endif
             continue;
         }
 
@@ -325,6 +401,14 @@ void loop() {
         if (fill[m] < SAMPLES)
             reads[m][fill[m]++] = val;
     }
+
+#if CROWDED_AREA
+    if (bg_capturing) {
+        bool done = true;
+        for (int i = 0; i < 4; i++) if (bg_fill[i] < SAMPLES) { done = false; break; }
+        if (done) update_bg_xcorr();
+    }
+#endif
 
     if (!recording) return;
     for (int i = 0; i < 4; i++) if (fill[i] < SAMPLES) return;
