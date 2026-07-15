@@ -101,6 +101,8 @@ static double xcorr_tdoa(const int* a, const unsigned int* a_ts, int va,
     for (int i = 1; i <= 2 * XCORR_RANGE; i++)
         if (xcorr[i] > xcorr[pk]) pk = i;
 
+    if (xcorr[pk] <= 0) return NAN;   // signals uncorrelated → no reliable TDOA
+
     double interp = pk;
     if (pk > 0 && pk < 2 * XCORR_RANGE) {
         double fa = xcorr[pk-1], fb = xcorr[pk], fc = xcorr[pk+1];
@@ -160,24 +162,28 @@ static AnnotatedVec cone_intersect(const Cone& c1, const Cone& c2) {
 static Vector sound_direction() {
     for (int i = 0; i < 6; i++) {
         int a = MIC_PAIRS[i][0], b = MIC_PAIRS[i][1];
-        double dt   = xcorr_tdoa(reads[a], ts[a], VOLTAGE[a], reads[b], ts[b], VOLTAGE[b]);
+        double dt = xcorr_tdoa(reads[a], ts[a], VOLTAGE[a], reads[b], ts[b], VOLTAGE[b]);
         dt -= (CH_SKEW_US[b] - CH_SKEW_US[a]) * 1e-6;
-        if (fabs(dt) < 1e-9) {
-            // source equidistant from this pair; cone normal would be zero → skip
-            cones[i] = Cone();
-            continue;
-        }
+        if (isnan(dt))                              { cones[i] = Cone(); continue; } // uncorrelated
+        if (fabs(dt) < 1e-9)                        { cones[i] = Cone(); continue; } // equidistant
         double dist = magnitude(MIC_LOC[b] - MIC_LOC[a]);
-        cones[i]    = Cone(normalize(MIC_LOC[b] - MIC_LOC[a]) * sign_of(dt),
-                           cone_slope(dt, dist));
+        if (SPEED_SOUND * fabs(dt) >= dist)         { cones[i] = Cone(); continue; } // impossible TDOA
+        cones[i] = Cone(normalize(MIC_LOC[b] - MIC_LOC[a]) * sign_of(dt),
+                        cone_slope(dt, dist));
     }
+
+    // Sum valid cone normals → guide vector pointing toward the source hemisphere.
+    // Each cone normal already points toward the closer mic (= source side), so
+    // the sum is a stable, geometry-free reference for resolving the 180° ambiguity.
+    Vector guide(0, 0, 0);
+    for (int i = 0; i < 6; i++)
+        if (magnitude(cones[i].n) > 0.5) guide = guide + cones[i].n;
 
     Vector candidates[13];
     int n = 0;
     for (int i = 0; i < 5; i++) {
         for (int j = i + 1; j < 6; j++) {
             if ((i == 0 && j == 5) || (i == 1 && j == 4)) continue; // co-axial pairs
-            // skip any pair that had a zero-dt cone (normal is zero vector)
             if (magnitude(cones[i].n) < 0.5 || magnitude(cones[j].n) < 0.5) continue;
             AnnotatedVec av = cone_intersect(cones[i], cones[j]);
             if (!av.edge || INCL_EDGE) candidates[n++] = av.v;
@@ -186,17 +192,13 @@ static Vector sound_direction() {
 
     if (n == 0) return Vector(0, 0, 1);
 
-    // First pass: rough consensus direction
-    Vector prelim(0, 0, 0);
-    for (int i = 0; i < n; i++) prelim = prelim + candidates[i];
-
-    // Second pass: flip candidates that point against the consensus, then resum.
-    // Resolves the 180° ambiguity that the z>0 heuristic inside cone_intersect
-    // misses for near-horizontal sources.
+    // Single-pass consensus: flip any candidate pointing against the guide, then sum.
+    // Faster than the old two-pass and more reliable because the guide is derived
+    // directly from which mic received first rather than from the candidates themselves.
     Vector sum(0, 0, 0);
     for (int i = 0; i < n; i++) {
         Vector v = candidates[i];
-        if (dot(v, prelim) < 0.0) v = v * -1;
+        if (dot(v, guide) < 0.0) v = v * -1;
         sum = sum + v;
     }
 
